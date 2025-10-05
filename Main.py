@@ -1,11 +1,15 @@
-# app.py — MeetEase (FAST, single-file, NO DB)
-# --------------------------------------------------------------------------------------
-# - No database required (stores small JSON artifacts under ./cache).
-# - OCR: PyMuPDF + Tesseract (optional).
-# - Indexing: FAISS (if available) + BM25 with disk caching.
-# - STT: faster-whisper (CTranslate2) with ffmpeg/pydub fallback.
-# - LLM: OpenAI optional (set key below or via env); graceful fallbacks if not set.
-# --------------------------------------------------------------------------------------
+# MeetEase — FAST version (optimized, NO DB)
+# -------------------------------------------------------------
+# Key improvements:
+# - No database required (stores small JSON/text artifacts under ./cache)
+# - Switch to faster-whisper (CTranslate2) for 2–10× faster STT on CPU/GPU
+# - Replace MoviePy with direct ffmpeg extraction (much faster & safer)
+# - Aggressive caching for embeddings, tokenizers, splitters, and extracted text
+# - Skip re-embedding when document+settings unchanged (settings hash includes doc_hash)
+# - Smarter PDF OCR: only OCR low-text pages; lower DPI to 200
+# - Larger chunk size to reduce chunk count (1400/160 overlap)
+# - Indices persisted per session folder (FAISS + BM25)
+# -------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -14,30 +18,31 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# ============================== CONFIG ===============================
-# You can override via environment variables if you want
-OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
-
-# Embeddings
-EMBED_MODE         = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
-MINILM_MODEL_NAME  = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
-
-# Whisper / OCR / Tokenization
-WHISPER_MODEL      = os.getenv("MEETEASE_WHISPER_MODEL", "base")
-TEMPERATURE        = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
-MAX_INPUT_TOKENS   = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
-TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
-
-# Caches & uploads
+# ------------------ ENV ------------------
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
 
-# ============================== UI ===============================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
+
+# Embeddings & LLM config
+EMBED_MODE = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
+MINILM_MODEL_NAME = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
+OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
+
+# Whisper / OCR config
+WHISPER_MODEL = os.getenv("MEETEASE_WHISPER_MODEL", "base")
+TEMPERATURE   = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
+MAX_INPUT_TOKENS = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
+TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ------------------ UI -------------------
 import streamlit as st
 st.set_page_config(page_title="MeetEase — Meeting Management (No-DB)", page_icon="🎯", layout="wide")
 st.markdown("""
@@ -59,61 +64,50 @@ textarea {border-radius: 10px !important;}
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management (No-DB)</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance — all cached locally.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance — locally cached.</div>', unsafe_allow_html=True)
 st.write("")
 
-# ============================== OPENAI KEY (DIRECT, NO SIDEBAR) ===============================
-# Set your key here OR via environment variable OPENAI_API_KEY.
-OPENAI_API_KEY_FALLBACK = "YOUR_OPENAI_API_KEY_HERE"  # <-- put your key here (or leave blank to rely on env)
-_openai_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY_FALLBACK).strip()
-
-# Store into session/env exactly like the old sidebar did, but without UI.
-if "OPENAI_API_KEY" not in st.session_state:
-    st.session_state.OPENAI_API_KEY = _openai_key
-else:
-    # If env provided a key later (e.g., on rerun), keep the non-empty one
-    if not st.session_state.OPENAI_API_KEY and _openai_key:
-        st.session_state.OPENAI_API_KEY = _openai_key
-
-# Propagate to environment for langchain_openai
-if st.session_state.OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = st.session_state.OPENAI_API_KEY
-
-# ============================== FILE STORAGE (NO DB) ===============================
+# ---------------- FILE/SESSION HELPERS (No-DB) ----------------
 def _slug(s: str) -> str:
     s = re.sub(r"[^\w\-]+", "-", s.strip().lower()).strip("-")
     return re.sub(r"-+", "-", s) or "session"
 
-def _session_id(title: str, mdate: date, doc_hash: str) -> str:
-    base = f"{_slug(title)}-{mdate.isoformat()}-{doc_hash[:8]}"
-    return base
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-def _sess_dir(session_id: str) -> str:
+def settings_hash(d: Dict) -> str:
+    s = json.dumps(d, sort_keys=True)
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def session_id_for(title: str, mdate: date, doc_hash: str) -> str:
+    return f"{_slug(title)}-{mdate.isoformat()}-{doc_hash[:8]}"
+
+def sess_dir(session_id: str) -> str:
     d = os.path.join(CACHE_DIR, session_id)
     os.makedirs(d, exist_ok=True)
     return d
 
-def _write_text(path: str, text: str):
+def write_text(path: str, text: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text or "")
 
-def _read_text(path: str) -> str:
+def read_text(path: str) -> str:
     if not os.path.isfile(path): return ""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-def _write_json(path: str, obj: Dict):
+def write_json(path: str, obj: Dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _read_json(path: str) -> Dict:
+def read_json(path: str) -> Dict:
     if not os.path.isfile(path): return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ============================== OCR / FILES ===============================
+# ---------------- OCR / FILES ------------
 from PIL import Image
 import numpy as np
 import pytesseract
@@ -124,14 +118,7 @@ import cv2
 if TESSERACT_PATH_WIN:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH_WIN
 
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-def settings_hash(d: Dict) -> str:
-    s = json.dumps(d, sort_keys=True)
-    return hashlib.sha256(s.encode()).hexdigest()
-
-# ============================== TOKENIZER ===============================
+# -------------- TOKENIZER / CACHE -------------------
 @st.cache_resource(show_spinner=False)
 def token_encoder_cached():
     try:
@@ -149,7 +136,7 @@ def truncate_tokens(text: str, max_tokens: int) -> str:
     ids = enc.encode(text or "")
     return enc.decode(ids[:max_tokens])
 
-# ============================== EMBEDDINGS / VECTORS ===============================
+# -------- Embeddings / FAISS / BM25 -----
 FAISS_AVAILABLE = True
 try:
     from langchain_community.vectorstores import FAISS
@@ -176,12 +163,14 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings_cached():
-    # Use OpenAI embeddings only if a key is present and the package is available
-    if EMBED_MODE == "openai" and st.session_state.OPENAI_API_KEY and OPENAI_EMB_OK:
+    if EMBED_MODE == "openai" and OPENAI_API_KEY and OPENAI_EMB_OK:
         return OpenAIEmbeddings(model=OPENAI_EMBED_MODEL)
     if HF_OK:
-        return HuggingFaceEmbeddings(model_name=MINILM_MODEL_NAME, encode_kwargs={"normalize_embeddings": True})
-    # Minimal dummy fallback
+        return HuggingFaceEmbeddings(
+            model_name=MINILM_MODEL_NAME,
+            encode_kwargs={"normalize_embeddings": True}
+        )
+    # tiny fallback
     class _Tiny:
         def embed_documents(self, texts): return [[hashlib.md5(t.encode()).hexdigest().__hash__()%997] for t in texts]
         def embed_query(self, text): return [hashlib.md5(text.encode()).hexdigest().__hash__()%997]
@@ -202,7 +191,7 @@ def faiss_save(store, path_dir: str):
         store.save_local(path_dir)
 
 def faiss_load(path_dir: str, embeddings):
-    if not FAISS_AVAILABLE or not os.path.isdir(path_dir): 
+    if not FAISS_AVAILABLE or not os.path.isdir(path_dir):
         return None
     try:
         return FAISS.load_local(path_dir, embeddings, allow_dangerous_deserialization=True)
@@ -219,7 +208,7 @@ def bm25_load(path_file: str) -> Optional[BM25Okapi]:
     with open(path_file, "rb") as f:
         return pickle.load(f)
 
-# ============================== LLM ===============================
+# ------------- LLM / Prompts -------------
 CHAT_OK = True
 try:
     from langchain_openai import ChatOpenAI
@@ -236,26 +225,26 @@ if CHAT_OK:
             "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
             "Discussion points:\n{discussion_points}\n\n"
             "Relevant context (from docs):\n{context}\n\n"
-            "Return a professional agenda with clear sections and a logical flow."
+            "Return a professional agenda with sections, timings (optional), and logical flow."
         ),
     )
     SUMMARY_PROMPT_JSON = PromptTemplate(
         input_variables=["ctx", "transcript", "query"],
         template=(
             "Using the context and transcript, produce a crisp post-meeting summary with:\n"
-            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items (owner & due date if stated)\n\n"
+            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items with Owners & due dates when stated\n\n"
             "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
             "Return JSON with keys: topics, decisions, action_items."
         ),
     )
 
 @st.cache_resource(show_spinner=False)
-def maybe_llm(max_tokens=400, temperature=0.2):
-    if not (st.session_state.OPENAI_API_KEY and CHAT_OK):
+def maybe_llm(max_tokens=400, temperature=TEMPERATURE):
+    if not (OPENAI_API_KEY and CHAT_OK):
         return None
     return ChatOpenAI(model=OPENAI_MODEL, temperature=temperature, max_tokens=max_tokens)
 
-def run_json(chain, **kwargs) -> Dict:
+def run_json(chain: Optional["LLMChain"], **kwargs) -> Dict:
     if chain is None:
         return {"topics": [], "decisions": [], "action_items": []}
     out = chain.run(**kwargs).strip()
@@ -280,15 +269,14 @@ def dedupe_lines(text: str) -> str:
         seen.add(key); out.append(line)
     return "\n".join(out)
 
-# ============================== STT ===============================
+# ------------------ STT (FAST) ------------------
+from pydub import AudioSegment
 FW_OK = True
 try:
     from faster_whisper import WhisperModel
 except Exception:
     FW_OK = False
     WhisperModel = None
-
-from pydub import AudioSegment
 
 @st.cache_resource(show_spinner=False)
 def load_whisper(model_name: str):
@@ -298,6 +286,7 @@ def load_whisper(model_name: str):
     compute_type = "float16" if device == "cuda" else "int8"
     return WhisperModel(model_name, device=device, compute_type=compute_type)
 
+# Temp helpers
 def safe_tmp_path(suffix=".wav") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
@@ -318,6 +307,7 @@ def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
     except Exception:
         pass
 
+# Fast audio extraction using ffmpeg or pydub fallback
 def extract_audio_to_wav(media_path: str) -> str:
     out_wav = safe_tmp_path(".wav")
     ff = shutil.which("ffmpeg")
@@ -325,30 +315,11 @@ def extract_audio_to_wav(media_path: str) -> str:
         subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     else:
-        # Fallback: pydub (works if codecs present in the environment)
+        # Fallback if ffmpeg not found
         AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
     return out_wav
 
-def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
-    model = load_whisper(WHISPER_MODEL)
-    if model is None:
-        return "(Transcription unavailable: faster-whisper not installed on host)"
-    segments, info = model.transcribe(
-        audio_path, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=800)
-    )
-    text_parts, total_dur = [], (getattr(info, "duration", None) or 1.0)
-    last_t = 0.0
-    for seg in segments:
-        text_parts.append(seg.text.strip())
-        last_t = getattr(seg, "end", None) or last_t
-        if progress_cb:
-            p = min(1.0, last_t / total_dur)
-            progress_cb(p, max(0.0, total_dur - last_t))
-    final = " ".join(t for t in text_parts if t)
-    final = re.sub(r"\s+", " ", final).strip()
-    return dedupe_lines(final)
-
-# ============================== OCR EXTRACTORS ===============================
+# ------------- OCR EXTRACTORS -------------
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3,3), 0)
@@ -376,12 +347,12 @@ def cached_extract_pdf_text(doc_hash: str, pdf_bytes: bytes) -> str:
     for i in range(doc.page_count):
         pg = doc.load_page(i)
         raw = pg.get_text("text").strip()
-        if len(raw) < 80:
+        if len(raw) < 80:  # only OCR low-text pages
             pix = pg.get_pixmap(dpi=200)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             proc = preprocess_for_ocr(bgr)
-            raw = pytesseract.image_to_string(Image.fromarray(proc))
+            raw = pil_ocr(proc)
         out.append(raw)
     return "\n".join(out)
 
@@ -400,20 +371,20 @@ def cached_extract_image_text(doc_hash: str, img_bytes: bytes) -> str:
         raw = pytesseract.image_to_string(Image.fromarray(proc))
     return raw
 
-# ============================== RAG HELPERS ===============================
-def build_and_persist_indices(session_id: str, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict):
+# --------------- RAG HELPERS (No-DB) ---------------
+def build_and_persist_indices(session_id: str, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict) -> Tuple[Optional[object], Optional[BM25Okapi], List[str], str, str]:
     s_hash = settings_hash({
         "embed_mode": embed_mode,
         "model": MINILM_MODEL_NAME if embed_mode=="minilm" else OPENAI_EMBED_MODEL,
         "splitter": splitter_conf,
         "doc_hash": doc_hash,
     })
-    sess_dir = _sess_dir(session_id)
-    faiss_dir = os.path.join(sess_dir, f"faiss_{s_hash[:8]}")
-    bm25_path = os.path.join(sess_dir, f"bm25_{s_hash[:8]}.pkl")
+    sdir = sess_dir(session_id)
+    faiss_dir = os.path.join(sdir, f"faiss_{s_hash[:8]}")
+    bm25_path = os.path.join(sdir, f"bm25_{s_hash[:8]}.pkl")
 
     embeddings = get_embeddings_cached()
-    chunks = build_chunks(full_text)
+    chunks = build_chunks(full_text or "")
 
     store = None
     if FAISS_AVAILABLE:
@@ -425,23 +396,24 @@ def build_and_persist_indices(session_id: str, doc_hash: str, full_text: str, em
                 store = _FAISS.from_texts(chunks, embeddings)
                 faiss_save(store, faiss_dir)
             except Exception:
-                store = None  # continue with BM25
+                store = None
 
     bm25 = bm25_load(bm25_path)
     if bm25 is None:
         bm25 = BM25Okapi([c.split() for c in chunks])
         bm25_save(bm25, bm25_path)
 
-    # persist chunks too (for debug/inspection)
-    _write_json(os.path.join(sess_dir, "chunks.json"), {"chunks": chunks})
-    # remember index metadata
-    _write_json(os.path.join(sess_dir, "indices.json"), {
-        "doc_hash": doc_hash, "bm25_path": bm25_path, "faiss_path": faiss_dir if store else "", 
+    # persist chunks and indices meta
+    write_json(os.path.join(sdir, "chunks.json"), {"chunks": chunks})
+    write_json(os.path.join(sdir, "indices.json"), {
+        "doc_hash": doc_hash,
+        "bm25_path": bm25_path,
+        "faiss_path": faiss_dir if store else "",
         "embed_mode": ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME)
     })
     return store, bm25, chunks, faiss_dir, bm25_path
 
-def select_context(store, bm25, chunks: List[str], query: str, k:int=4) -> str:
+def select_context(store: Optional[object], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
     ctx = ""
     if store:
         try:
@@ -473,7 +445,7 @@ def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tupl
             unresolved.append(p)
     return resolved, unresolved
 
-# ============================== DIAGNOSTICS ===============================
+# --------------- Diagnostics ---------------
 with st.expander("🔧 Diagnostics (click to expand)"):
     info_cols = st.columns(2)
     with info_cols[0]:
@@ -484,13 +456,13 @@ with st.expander("🔧 Diagnostics (click to expand)"):
         st.write("**faster-whisper**", "OK" if FW_OK else "missing")
         st.write("**FAISS**", "OK" if FAISS_AVAILABLE else "missing (BM25 fallback)")
         st.write("**HF Embeddings**", "OK" if HF_OK else "missing")
-        st.write("**OpenAI (LLM/Emb)**", "enabled" if st.session_state.OPENAI_API_KEY else "disabled")
+        st.write("**OpenAI (LLM/Emb)**", "enabled" if OPENAI_API_KEY else "disabled")
     with info_cols[1]:
         sess_count = len([d for d in os.listdir(CACHE_DIR) if os.path.isdir(os.path.join(CACHE_DIR, d))])
         st.write("**Cache dir**", os.path.abspath(CACHE_DIR))
         st.write("**Sessions cached**", sess_count)
 
-# ============================== APP STATE ===============================
+# --------------- UI STATE ---------------
 @dataclass
 class AppState:
     session_id: Optional[str] = None
@@ -501,19 +473,17 @@ class AppState:
     bm25: Optional[BM25Okapi] = None
     last_transcript: Optional[str] = None
     last_doc_text: Optional[str] = None
-    last_agenda: Optional[str] = None
-    last_summary: Optional[Dict] = None
 
 if "app" not in st.session_state:
     st.session_state.app = AppState()
 app: AppState = st.session_state.app
 
-# ============================== TABS ===============================
+# ----------------- TABS ------------------
 tab_pre, tab_agenda, tab_track, tab_summary = st.tabs(
     ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary"]
 )
 
-# ---------------- PRE-MEETING ----------------
+# -------- PRE-MEETING TAB --------
 with tab_pre:
     st.markdown("### 📄 Pre-Meeting — Documents & Discussion Points")
     colA, colB = st.columns([1.15, 1])
@@ -535,14 +505,13 @@ with tab_pre:
             raw = up.read()
             doc_hash = sha256_bytes(raw)
             app.document_hash = doc_hash
-            session_id = _session_id(title.strip(), mdate, doc_hash)
-            app.session_id = session_id
-            sess_dir = _sess_dir(session_id)
+            app.session_id = session_id_for(title.strip(), mdate, doc_hash)
+            sdir = sess_dir(app.session_id)
 
             # Extract or reuse text
-            extracted_path = os.path.join(sess_dir, "extracted.txt")
+            extracted_path = os.path.join(sdir, "extracted.txt")
             if os.path.isfile(extracted_path):
-                text = _read_text(extracted_path)
+                text = read_text(extracted_path)
                 ocr_bar.progress(1.0, text="Reusing cached text")
             else:
                 ext = (up.name.split(".")[-1] or "").lower()
@@ -560,23 +529,24 @@ with tab_pre:
                     ocr_bar.progress(1.0, text="Image OCR done")
                 else:
                     st.error("Unsupported file type."); st.stop()
-                _write_text(extracted_path, text)
+                write_text(extracted_path, text)
 
             app.last_doc_text = text
 
-            # Build or load indices
+            # Build / load indices for this session
             st.info("Building / loading indices...")
             splitter_conf = {"chunk_size":1400, "overlap":160}
             app.faiss_store, app.bm25, app.chunks, _, _ = build_and_persist_indices(
-                session_id, doc_hash, app.last_doc_text or "", EMBED_MODE, splitter_conf
+                app.session_id, app.document_hash or "", app.last_doc_text or "",
+                EMBED_MODE, splitter_conf
             )
 
             app.discussion_points = [p.strip() for p in dpoints.split(",") if p.strip()]
-            _write_json(os.path.join(sess_dir, "meta.json"), {
+            write_json(os.path.join(sdir, "meta.json"), {
                 "title": title.strip(), "date": mdate.isoformat(), "discussion_points": app.discussion_points
             })
 
-            st.success(f"Context ready! Session: `{session_id}` → Go to **Agenda** to generate an agenda.")
+            st.success(f"Context ready! Session: `{app.session_id}` → Go to **Agenda** to generate an agenda.")
 
     with colB:
         st.markdown("#### Document Snapshot")
@@ -589,7 +559,7 @@ with tab_pre:
         else:
             st.info("No document processed yet.")
 
-# ---------------- AGENDA ----------------
+# -------- AGENDA TAB --------
 with tab_agenda:
     st.markdown("### 📋 Agenda Creation")
     if not (app.session_id and app.discussion_points and (app.faiss_store or app.bm25)):
@@ -603,22 +573,21 @@ with tab_agenda:
             ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
             llm = maybe_llm(max_tokens=400, temperature=TEMPERATURE)
             if CHAT_OK and llm:
+                from langchain.chains import LLMChain
                 chain = LLMChain(prompt=AGENDA_PROMPT, llm=llm)
                 in_ctx = truncate_tokens(ctx, MAX_INPUT_TOKENS // 2)
                 agenda_md = chain.run(discussion_points="\n- " + "\n- ".join(app.discussion_points), context=in_ctx)
             else:
                 agenda_md = "## Agenda\n" + "\n".join(f"- {p}" for p in app.discussion_points)
 
-            app.last_agenda = agenda_md
-            _write_text(os.path.join(_sess_dir(app.session_id), "agenda.md"), agenda_md)
-
+            write_text(os.path.join(sess_dir(app.session_id), "agenda.md"), agenda_md)
             st.success("Agenda generated and saved to cache!")
             st.markdown("### Generated Agenda")
             st.markdown(f'<div class="card">{agenda_md}</div>', unsafe_allow_html=True)
             st.download_button("Download Agenda (.md)", data=agenda_md.encode("utf-8"),
                                file_name="agenda.md", mime="text/markdown", use_container_width=True)
 
-# ---------------- TRACKING ----------------
+# -------- TRACKING TAB --------
 with tab_track:
     st.markdown("### 🎥 Meeting Tracking & Agenda Resolution")
     if not (app.session_id and app.discussion_points):
@@ -647,14 +616,31 @@ with tab_track:
                     trans_bar.progress(p, text=f"Transcribing {int(p*100)}%")
                     eta_txt.markdown(f"<div class='small'>ETA ~ {int(eta)}s</div>", unsafe_allow_html=True)
 
+                transcript = ""
                 try:
-                    transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
-                    transcript = dedupe_lines(transcript)
-                    app.last_transcript = transcript
-                    _write_text(os.path.join(_sess_dir(app.session_id), "transcript.txt"), transcript)
-                    trans_bar.progress(1.0, text="Transcription complete")
+                    model = load_whisper(WHISPER_MODEL)
+                    if model is None:
+                        transcript = "(Transcription unavailable: faster-whisper not installed on host)"
+                    else:
+                        segments, info = model.transcribe(
+                            audio_path, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=800)
+                        )
+                        text_parts, total_dur = [], (getattr(info, "duration", None) or 1.0)
+                        last_t = 0.0
+                        for seg in segments:
+                            text_parts.append(seg.text.strip())
+                            last_t = getattr(seg, "end", None) or last_t
+                            if _progress_cb:
+                                p = min(1.0, last_t / total_dur)
+                                _progress_cb(p, max(0.0, total_dur - last_t))
+                        transcript = re.sub(r"\s+", " ", " ".join(t for t in text_parts if t)).strip()
+                        transcript = dedupe_lines(transcript)
                 finally:
                     safe_unlink(audio_path)
+
+                app.last_transcript = transcript
+                write_text(os.path.join(sess_dir(app.session_id), "transcript.txt"), transcript)
+                trans_bar.progress(1.0, text="Transcription complete")
 
                 resolved, unresolved = analyze_agenda_resolution(app.discussion_points, app.last_transcript or "")
 
@@ -671,7 +657,7 @@ with tab_track:
                 with st.expander("Show Transcript"):
                     st.write(app.last_transcript or "")
 
-# ---------------- SUMMARY ----------------
+# -------- SUMMARY TAB --------
 with tab_summary:
     st.markdown("### 📝 Post-Meeting Summary")
     if not (app.session_id and (app.faiss_store or app.bm25)):
@@ -696,10 +682,22 @@ with tab_summary:
                     trans_bar.progress(p, text=f"Transcribing {int(p*100)}%")
                     eta_txt.markdown(f"<div class='small'>ETA ~ {int(eta)}s</div>", unsafe_allow_html=True)
                 try:
-                    transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
-                    transcript = dedupe_lines(transcript)
+                    model = load_whisper(WHISPER_MODEL)
+                    if model is None:
+                        transcript = "(Transcription unavailable: faster-whisper not installed on host)"
+                    else:
+                        segments, info = model.transcribe(
+                            audio_path, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=800)
+                        )
+                        text_parts, total_dur = [], (getattr(info, "duration", None) or 1.0)
+                        last_t = 0.0
+                        for seg in segments:
+                            text_parts.append(seg.text.strip())
+                            last_t = getattr(seg, "end", None) or last_t
+                            p = min(1.0, last_t / total_dur); _progress_cb(p, max(0.0, total_dur - last_t))
+                        transcript = re.sub(r"\s+", " ", " ".join(t for t in text_parts if t)).strip()
+                        transcript = dedupe_lines(transcript)
                     app.last_transcript = transcript
-                    _write_text(os.path.join(_sess_dir(app.session_id), "transcript.txt"), transcript)
                 finally:
                     safe_unlink(audio_path)
 
@@ -707,16 +705,15 @@ with tab_summary:
                 st.error("No transcript available. Upload media in **Tracking** or here.")
             else:
                 if not app.last_doc_text:
-                    extracted_path = os.path.join(_sess_dir(app.session_id), "extracted.txt")
-                    app.last_doc_text = _read_text(extracted_path)
+                    extracted_path = os.path.join(sess_dir(app.session_id), "extracted.txt")
+                    app.last_doc_text = read_text(extracted_path)
                 app.chunks = build_chunks(app.last_doc_text)
 
                 q = (", ".join(app.discussion_points or []) + " " + query).strip()
                 ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
-
                 llm = maybe_llm(max_tokens=450, temperature=TEMPERATURE)
                 if CHAT_OK and llm:
-                    from langchain.chains import LLMChain  # safe re-import in case of lazy load
+                    from langchain.chains import LLMChain
                     chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm)
                     obj = run_json(
                         chain,
@@ -732,8 +729,7 @@ with tab_summary:
                         "action_items": []
                     }
 
-                app.last_summary = obj
-                _write_json(os.path.join(_sess_dir(app.session_id), "summary.json"), obj)
+                write_json(os.path.join(sess_dir(app.session_id), "summary.json"), obj)
 
                 st.markdown("### Summary (JSON)")
                 st.code(json.dumps(obj, indent=2))
@@ -743,6 +739,6 @@ with tab_summary:
                                    mime="application/json",
                                    use_container_width=True)
 
-# ---------------- NOTES ----------------
-if not st.session_state.OPENAI_API_KEY:
-    st.info("No OpenAI API key set. Agenda/Summary will use robust fallbacks. Embeddings default to MiniLM (CPU).")
+# ======= FINAL NOTE =======
+if not OPENAI_API_KEY:
+    st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
