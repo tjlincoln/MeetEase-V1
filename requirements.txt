@@ -9,7 +9,6 @@ pillow
 pytesseract
 pymupdf
 python-docx
-opencv-python-headless
 numpy
 langchain
 langchain-openai
