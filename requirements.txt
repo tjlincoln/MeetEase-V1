@@ -30,6 +30,7 @@ tqdm
 aiohttp
 requests
 moviepy
+opencv
 imageio[ffmpeg]
 psycopg2-binary
 python-dotenv
