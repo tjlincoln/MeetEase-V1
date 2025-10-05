@@ -1,0 +1,41 @@
+# -----------------------------
+# MeetEase — FAST Version
+# Dependencies for Streamlit, AI, OCR, STT, and DB
+# -----------------------------
+
+streamlit
+pymysql
+pillow
+pytesseract
+pymupdf
+python-docx
+opencv-python-headless
+numpy
+langchain
+langchain-openai
+langchain-community
+sentence-transformers
+faiss-cpu
+rank-bm25
+tiktoken
+faster-whisper
+pydub
+openai
+opencv-python
+cryptography
+pyyaml
+coloredlogs
+filelock
+tqdm
+aiohttp
+requests
+moviepy
+imageio[ffmpeg]
+psycopg2-binary
+python-dotenv
+
+
+
+
+
+
