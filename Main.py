@@ -39,7 +39,7 @@ os.makedirs(CACHE_DIR,  exist_ok=True)
 
 # ============================== OPENAI API KEY (NO SIDEBAR) ===============================
 # Replace "sk-your-key-here" with your real key or set via environment variable.
-FIXED_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "sk-your-key-here")
+FIXED_OPENAI_KEY = os.getenv("OPENAI_API_KEY", "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")
 
 if not FIXED_OPENAI_KEY or not FIXED_OPENAI_KEY.startswith("sk-"):
     import streamlit as st
