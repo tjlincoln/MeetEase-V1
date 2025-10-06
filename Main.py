@@ -24,7 +24,7 @@ CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
 # chalse k env ma nakhvu pdse?
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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").strip()
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
 
