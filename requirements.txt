@@ -19,3 +19,4 @@ pydub
 numpy
 torch
 transformers
+psycopg2
